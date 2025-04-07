@@ -3,19 +3,24 @@ from datetime import datetime
 import pytz
 
 import pandas as pd
+import numpy as np
 
 
-def load_data(ticker='BNB', start_date=None, end_date=None, limit=None, max_gap_seconds=15):
+def load_data(ticker='BNB', start_date=None, end_date=None, limit=None, max_gap_seconds=60, fullbook=False):
+
+    # Convert string dates to datetime
     if isinstance(start_date, str):
         start_date = pd.to_datetime(start_date)
     if isinstance(end_date, str):
         end_date = pd.to_datetime(end_date)
     
+    # Set default dates
     if start_date is None:
         start_date = datetime(2025, 1, 1)
     if end_date is None:
         end_date = datetime.now()
     
+    # Ensure timezone info
     utc = pytz.UTC
     if start_date.tzinfo is None:
         start_date = utc.localize(start_date)
@@ -25,69 +30,307 @@ def load_data(ticker='BNB', start_date=None, end_date=None, limit=None, max_gap_
     ticker = f"{ticker}USDT"
     
     try:
-        client = MongoClient('mongodb://localhost:27017/')
+        # Optimize MongoDB connection
+        client = MongoClient('mongodb://localhost:27017/', 
+                             maxPoolSize=50,
+                             connectTimeoutMS=30000,
+                             socketTimeoutMS=30000)
         db = client['crypto_orderbook']
         collection = db['orderbook_deep']
+        
+        # Ensure proper indexes exist (uncomment if you need to create them)
+        # collection.create_index([('symbol', 1), ('timestamp', 1)])
+        
+        # Format dates for query
+        start_date_str = start_date.strftime('%Y-%m-%d %H:%M:%S')
+        end_date_str = end_date.strftime('%Y-%m-%d %H:%M:%S')
         
         query = {
             'symbol': ticker,
             'timestamp': {
-                '$gte': start_date.strftime('%Y-%m-%d %H:%M:%S'),
-                '$lte': end_date.strftime('%Y-%m-%d %H:%M:%S')
+                '$gte': start_date_str,
+                '$lte': end_date_str
             }
         }
         
-        if limit:
-            cursor = collection.find(query).limit(limit)
+        # Use projection to only retrieve necessary fields
+        projection = {'timestamp': 1, 'symbol': 1}
+        if fullbook:
+            # Need full orderbook data
+            projection.update({'bids': 1, 'asks': 1})
         else:
-            cursor = collection.find(query)
+            # Only need first few levels for midprice extraction
+            projection.update({'bids': {'$slice': 1}, 'asks': {'$slice': 1}})
         
-        records = list(cursor)
+        # Process in optimized batches
+        batch_size = 10000
+        all_processed_dfs = []
+        current_segment = []
+        last_timestamp = None
+        total_records = 0
+        
+        # Sort by timestamp for consistent results
+        cursor = collection.find(query, projection).sort('timestamp', 1)
+        if limit:
+            cursor = cursor.limit(limit)
+        
+        # Set larger batch size for network efficiency
+        cursor = cursor.batch_size(1000)
+        
+        # Process in streaming batches to avoid memory issues
+        for record in cursor:
+            total_records += 1
+            
+            try:
+                # Convert timestamp to datetime
+                timestamp = pd.to_datetime(record['timestamp'])
+                
+                # Check for time gaps
+                if last_timestamp is not None:
+                    time_diff = (timestamp - last_timestamp).total_seconds()
+                    if time_diff > max_gap_seconds:
+                        # Process current segment if large enough
+                        if len(current_segment) >= 360:  # half-hour data
+                            segment_df = pd.DataFrame(current_segment)
+                            segment_df = segment_df.sort_values('timestamp')
+                            
+                            if fullbook:
+                                processed_df = process_orderbook_segmented(segment_df)
+                            else:
+                                # No need for full processing, we already extracted midprice
+                                processed_df = segment_df
+                            
+                            all_processed_dfs.append(processed_df)
+                        
+                        # Start a new segment
+                        current_segment = []
+                
+                # Extract data based on mode
+                bids = record.get('bids', [])
+                asks = record.get('asks', [])
+                
+                if not bids or not asks:
+                    continue
+                
+                best_bid = bids[0]['price']
+                best_ask = asks[0]['price']
+                mid_price = (best_bid + best_ask) / 2
+                spread = best_ask - best_bid
+                
+                # Create a simplified record with just what we need
+                new_record = {
+                    'timestamp': timestamp,
+                    'symbol': record.get('symbol'),
+                    'mid_price': mid_price,
+                    'spread': spread
+                }
+                
+                # If we need full orderbook data, keep original record for later processing
+                if fullbook:
+                    new_record['bids'] = bids
+                    new_record['asks'] = asks
+                
+                current_segment.append(new_record)
+                last_timestamp = timestamp
+                
+                # Output progress for large datasets
+                if total_records % batch_size == 0:
+                    print(f"Processed {total_records} records...")
+                
+            except (KeyError, IndexError, TypeError) as e:
+                print(f"Skipping record due to: {e}")
+                continue
+        
+        # Process the final segment
+        if len(current_segment) >= 360:
+            segment_df = pd.DataFrame(current_segment)
+            segment_df = segment_df.sort_values('timestamp')
+            
+            if fullbook:
+                processed_df = process_orderbook_segmented(segment_df)
+            else:
+                # No need for full processing, we already extracted midprice
+                processed_df = segment_df
+            
+            all_processed_dfs.append(processed_df)
+        
         client.close()
         
-        if not records:
-            print(f"No data found for {ticker} between {start_date} and {end_date}")
+        if not all_processed_dfs:
+            print(f"No valid data segments found for {ticker} between {start_date} and {end_date}")
             return []
         
-        df = pd.DataFrame(records)
-        if 'timestamp' in df.columns:
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-            df = df.sort_values('timestamp')
-        
-        # Calculate time differences between consecutive rows
-        df['time_diff'] = df['timestamp'].diff().dt.total_seconds()
-        
-        # Find gaps where time difference exceeds the max_gap_seconds
-        gap_indices = df[df['time_diff'] > max_gap_seconds].index.tolist()
-        
-        # Split the dataframe at the gap points
-        dfs = []
-        if gap_indices:
-            start_idx = 0
-            for idx in gap_indices:
-                chunk = df.iloc[start_idx:idx].copy()
-                if len(chunk) >= 360: # haft-hour data
-                    processd_chuck = process_orderbook_segmented(chunk)
-                    dfs.append(processd_chuck)
-                start_idx = idx
-            
-            # Don't forget the last chunk
-            last_chunk = df.iloc[start_idx:].copy()
-            if len(last_chunk) >= 360: # haft-hour data
-                processd_last_chunk = process_orderbook_segmented(last_chunk)
-                dfs.append(processd_last_chunk)
-        else:
-            # No gaps found, process the entire dataframe
-            df_copy = process_orderbook_segmented(df)
-            dfs.append(df_copy)
-        
-        print(f"Split data into {len(dfs)} continuous segments")
-        return dfs
+        print(f"Split data into {len(all_processed_dfs)} continuous segments")
+        print(f"Total records processed: {total_records}")
+        return all_processed_dfs
         
     except Exception as e:
         print(f"Error accessing MongoDB: {e}")
+        import traceback
+        traceback.print_exc()
         return []
     
+def load_multiple_tickers(tickers=None, start_date=None, end_date=None, limit=None, max_gap_seconds=60, time_threshold=1.0):
+    client = MongoClient('mongodb://localhost:27017/')
+    db = client['crypto_orderbook']
+    collection = db['orderbook_deep']
+    
+    if tickers == 'All':
+        all_symbols = collection.distinct('symbol')
+        tickers = [symbol.replace('USDT', '') for symbol in all_symbols]
+    elif not isinstance(tickers, list):
+        tickers = [tickers]
+    
+    ticker_segments = {}
+    max_segments = 0
+    
+    for ticker in tickers:
+        print(f"Loading data for {ticker}...")
+        ticker_data = load_data(ticker, start_date, end_date, limit, max_gap_seconds, fullbook=False)
+        
+        if ticker_data:
+            ticker_segments[ticker] = []
+            for segment_df in ticker_data:
+                segment_df = segment_df.set_index('timestamp')
+                if 'mid_price' in segment_df.columns:
+                    ticker_segments[ticker].append(segment_df[['mid_price']])
+            
+            max_segments = max(max_segments, len(ticker_segments[ticker]))
+            print(f"Loaded {len(ticker_segments[ticker])} segments for {ticker}")
+    
+    if not ticker_segments:
+        print("No data found for any of the specified tickers")
+        return []
+    
+    aligned_segments = []
+    
+    for i in range(max_segments):
+        segment_dfs = []
+        
+        for ticker in ticker_segments:
+            if i < len(ticker_segments[ticker]):
+                segment_df = ticker_segments[ticker][i].copy()
+                segment_df.columns = [ticker]
+                segment_dfs.append(segment_df)
+        
+        if segment_dfs:
+            print(f"Aligning segment {i+1}/{max_segments} with {len(segment_dfs)} tickers")
+            combined_df = pd.concat(segment_dfs, axis=1)
+            aligned_df = align_by_time_proximity(combined_df, time_threshold)
+            
+            if not aligned_df.empty:
+                aligned_segments.append(aligned_df)
+    
+    print(f"Created {len(aligned_segments)} aligned segments")
+    return aligned_segments
+
+def align_by_time_proximity(df, time_threshold=8.0):
+    df_reset = df.reset_index()
+    timestamps = df_reset['timestamp'].drop_duplicates().sort_values().to_list()
+    
+    # Debug information
+    print(f"Processing {len(timestamps)} unique timestamps with threshold {time_threshold} seconds")
+    
+    if len(timestamps) <= 1:
+        return df
+    
+    # Group timestamps into clusters
+    clusters = []
+    current_cluster = [timestamps[0]]
+    
+    for i in range(1, len(timestamps)):
+        current_ts = timestamps[i]
+        prev_ts = current_cluster[-1]
+        time_diff = (current_ts - prev_ts).total_seconds()
+        
+        if time_diff <= time_threshold:
+            current_cluster.append(current_ts)
+        else:
+            clusters.append(current_cluster)
+            current_cluster = [current_ts]
+    
+    # Add the last cluster
+    if current_cluster:
+        clusters.append(current_cluster)
+    
+    print(f"Formed {len(clusters)} clusters from {len(timestamps)} timestamps")
+    
+    # Process each cluster
+    aligned_data = []
+    
+    for cluster in clusters:
+        if len(cluster) > 1:
+            # Calculate average timestamp for the cluster
+            avg_ts = pd.Timestamp(sum(t.value for t in cluster) // len(cluster))
+            
+            # Debug info
+            time_diffs = [(cluster[i+1] - cluster[i]).total_seconds() for i in range(len(cluster)-1)]
+            
+            data_point = {'timestamp': avg_ts}
+            for ticker in df.columns:
+                values = []
+                for ts in cluster:
+                    val = df_reset.loc[df_reset['timestamp'] == ts, ticker].values
+                    if len(val) > 0 and not pd.isna(val[0]):
+                        values.append(val[0])
+                
+                if values:
+                    data_point[ticker] = sum(values) / len(values)
+                else:
+                    data_point[ticker] = np.nan
+            
+            aligned_data.append(data_point)
+        else:
+            # Only one timestamp in cluster
+            single_ts = cluster[0]
+            data_point = {'timestamp': single_ts}
+            for ticker in df.columns:
+                val = df_reset.loc[df_reset['timestamp'] == single_ts, ticker].values
+                data_point[ticker] = val[0] if len(val) > 0 else np.nan
+            
+            aligned_data.append(data_point)
+    
+    if not aligned_data:
+        return pd.DataFrame()
+    
+    aligned_df = pd.DataFrame(aligned_data)
+    aligned_df = aligned_df.set_index('timestamp')
+    
+    return aligned_df
+
+################################################################################################################################################################################################################################################
+    
+def extract_midprice(df):
+    """Extract only the midprice from orderbook data for faster processing."""
+    if df.empty:
+        return pd.DataFrame()
+    
+    processed_data = []
+    
+    for idx, row in df.iterrows():
+        bids = row['bids']
+        asks = row['asks']
+        
+        new_row = {}
+        new_row['timestamp'] = row['timestamp']
+        new_row['symbol'] = row['symbol'] if 'symbol' in row else None
+        
+        if not bids or not asks:
+            processed_data.append(new_row)
+            continue
+        
+        best_bid = bids[0]['price']
+        best_ask = asks[0]['price']
+        mid_price = (best_bid + best_ask) / 2
+        spread = best_ask - best_bid
+        
+        new_row['mid_price'] = mid_price
+        new_row['spread'] = spread
+        
+        processed_data.append(new_row)
+    
+    result_df = pd.DataFrame(processed_data)
+    return result_df
 
 def process_orderbook_segmented(df, num_levels=1000, segment_size=10, time_window=5):
     if df.empty:
