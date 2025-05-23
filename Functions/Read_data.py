@@ -6,7 +6,34 @@ import pandas as pd
 import numpy as np
 
 
-def load_data(ticker='BNB', start_date=None, end_date=None, limit=None, max_gap_seconds=60, fullbook=False):
+def load_data(ticker='BNB', start_date=None, end_date=None, limit=None, max_gap_seconds=60, 
+              fullbook=False, num_levels=100, segment_size=10):
+    """
+    Load orderbook data from MongoDB with configurable processing parameters.
+    
+    Parameters:
+    -----------
+    ticker : str
+        The cryptocurrency ticker symbol (e.g., 'BNB')
+    start_date, end_date : datetime or str
+        Date range to query data for
+    limit : int, optional
+        Maximum number of records to retrieve
+    max_gap_seconds : int
+        Maximum allowed time gap between records in a segment
+    fullbook : bool
+        Whether to retrieve and process the full orderbook
+    num_levels : int
+        Number of price levels to process in the orderbook
+    segment_size : int
+        Number of price levels to group into each segment
+        
+    Returns:
+    --------
+    list of DataFrame
+        List of processed dataframes, each representing a continuous segment of data
+    """
+    num_levels = min(num_levels,1000)
 
     # Convert string dates to datetime
     if isinstance(start_date, str):
@@ -38,9 +65,6 @@ def load_data(ticker='BNB', start_date=None, end_date=None, limit=None, max_gap_
         db = client['crypto_orderbook']
         collection = db['orderbook_deep']
         
-        # Ensure proper indexes exist (uncomment if you need to create them)
-        # collection.create_index([('symbol', 1), ('timestamp', 1)])
-        
         # Format dates for query
         start_date_str = start_date.strftime('%Y-%m-%d %H:%M:%S')
         end_date_str = end_date.strftime('%Y-%m-%d %H:%M:%S')
@@ -56,8 +80,8 @@ def load_data(ticker='BNB', start_date=None, end_date=None, limit=None, max_gap_
         # Use projection to only retrieve necessary fields
         projection = {'timestamp': 1, 'symbol': 1}
         if fullbook:
-            # Need full orderbook data
-            projection.update({'bids': 1, 'asks': 1})
+            # Need full orderbook data but limit to requested levels for efficiency
+            projection.update({'bids': {'$slice': num_levels}, 'asks': {'$slice': num_levels}})
         else:
             # Only need first few levels for midprice extraction
             projection.update({'bids': {'$slice': 1}, 'asks': {'$slice': 1}})
@@ -95,7 +119,7 @@ def load_data(ticker='BNB', start_date=None, end_date=None, limit=None, max_gap_
                             segment_df = segment_df.sort_values('timestamp')
                             
                             if fullbook:
-                                processed_df = process_orderbook_segmented(segment_df)
+                                processed_df = process_orderbook_segmented(segment_df, num_levels, segment_size)
                             else:
                                 # No need for full processing, we already extracted midprice
                                 processed_df = segment_df
@@ -147,7 +171,7 @@ def load_data(ticker='BNB', start_date=None, end_date=None, limit=None, max_gap_
             segment_df = segment_df.sort_values('timestamp')
             
             if fullbook:
-                processed_df = process_orderbook_segmented(segment_df)
+                processed_df = process_orderbook_segmented(segment_df, num_levels, segment_size)
             else:
                 # No need for full processing, we already extracted midprice
                 processed_df = segment_df
@@ -169,6 +193,7 @@ def load_data(ticker='BNB', start_date=None, end_date=None, limit=None, max_gap_
         import traceback
         traceback.print_exc()
         return []
+  
     
 def load_multiple_tickers(tickers=None, start_date=None, end_date=None, limit=None, max_gap_seconds=60, time_threshold=1.0):
     client = MongoClient('mongodb://localhost:27017/')
@@ -186,7 +211,7 @@ def load_multiple_tickers(tickers=None, start_date=None, end_date=None, limit=No
     
     for ticker in tickers:
         print(f"Loading data for {ticker}...")
-        ticker_data = load_data(ticker, start_date, end_date, limit, max_gap_seconds, fullbook=False)
+        ticker_data = load_data(ticker, start_date, end_date, limit, max_gap_seconds, fullbook=False, num_levels=5, segment_size=5)
         
         if ticker_data:
             ticker_segments[ticker] = []
@@ -332,48 +357,82 @@ def extract_midprice(df):
     result_df = pd.DataFrame(processed_data)
     return result_df
 
-def process_orderbook_segmented(df, num_levels=1000, segment_size=10, time_window=5):
+def process_orderbook_segmented(df, num_levels=1000, segment_size=10):
+    """
+    Process orderbook data into segments and extract features.
+    
+    Parameters:
+    -----------
+    df : DataFrame
+        DataFrame containing orderbook data
+    num_levels : int
+        Number of price levels to process
+    segment_size : int
+        Number of price levels to group into each segment
+        
+    Returns:
+    --------
+    DataFrame
+        Processed data with extracted features
+    """
     if df.empty:
         return pd.DataFrame()
     
     num_segments = (num_levels + segment_size - 1) // segment_size
     
+    # Pre-allocate list with estimated size for better performance
     processed_data = []
     
-    for idx, row in df.iterrows():
-        bids = row['bids'][:num_levels] if len(row['bids']) >= num_levels else row['bids']
-        asks = row['asks'][:num_levels] if len(row['asks']) >= num_levels else row['asks']
+    # Use vectorized operations where possible
+    if 'bids' in df.columns and 'asks' in df.columns:
+        # Extract best bid/ask prices for all rows at once
+        df['best_bid'] = df['bids'].apply(lambda x: x[0]['price'] if x and len(x) > 0 else None)
+        df['best_ask'] = df['asks'].apply(lambda x: x[0]['price'] if x and len(x) > 0 else None)
         
-        new_row = {}
-        new_row['timestamp'] = row['timestamp']
+        # Calculate mid price and spread
+        mask = (~df['best_bid'].isna()) & (~df['best_ask'].isna())
+        df.loc[mask, 'mid_price'] = (df.loc[mask, 'best_bid'] + df.loc[mask, 'best_ask']) / 2
+        df.loc[mask, 'spread'] = df.loc[mask, 'best_ask'] - df.loc[mask, 'best_bid']
+    
+    for idx, row in df.iterrows():
+        if 'bids' not in row or 'asks' not in row:
+            continue
+            
+        bids = row['bids'][:num_levels] if len(row['bids']) >= 1 else []
+        asks = row['asks'][:num_levels] if len(row['asks']) >= 1 else []
         
         if not bids or not asks:
-            processed_data.append(new_row)
             continue
         
-        best_bid = bids[0]['price']
-        best_ask = asks[0]['price']
-        mid_price = (best_bid + best_ask) / 2
-        spread = best_ask - best_bid
+        new_row = {
+            'timestamp': row['timestamp'],
+            'mid_price': row.get('mid_price', None),
+            'spread': row.get('spread', None)
+        }
         
-        new_row['mid_price'] = mid_price
-        new_row['spread'] = spread
+        # Level-by-level imbalance for the first few levels - limit to 50 for performance
+        max_levels = min(50, min(len(bids), len(asks)))
         
-        # Level-by-level imbalance for the first few levels
-        for level in range(min(50, min(len(bids), len(asks)))):
-            bid_vol = bids[level]['volume']
-            ask_vol = asks[level]['volume']
-            total_vol = bid_vol + ask_vol
-            
-            new_row[f'bid_vol_level_{level+1}'] = bid_vol
-            new_row[f'ask_vol_level_{level+1}'] = ask_vol
-            
-            if total_vol > 0:
-                level_imbalance = bid_vol / total_vol
-                new_row[f'imbalance_level_{level+1}'] = level_imbalance
-            else:
-                new_row[f'imbalance_level_{level+1}'] = 0.5
+        # Process level data in batches for better performance
+        bid_vols = np.array([bid['volume'] for bid in bids[:max_levels]])
+        ask_vols = np.array([ask['volume'] for ask in asks[:max_levels]])
+        total_vols = bid_vols + ask_vols
         
+        # Vectorized calculation of imbalances
+        level_imbalances = np.divide(
+            bid_vols, 
+            total_vols, 
+            out=np.ones_like(bid_vols) * 0.5, 
+            where=total_vols > 0
+        )
+        
+        # Add to new_row
+        for level in range(max_levels):
+            new_row[f'bid_vol_level_{level+1}'] = bid_vols[level]
+            new_row[f'ask_vol_level_{level+1}'] = ask_vols[level]
+            new_row[f'imbalance_level_{level+1}'] = level_imbalances[level]
+        
+        # Initialize segment processing variables
         total_bid_volume = 0
         total_ask_volume = 0
         bid_notional = 0
@@ -382,6 +441,7 @@ def process_orderbook_segmented(df, num_levels=1000, segment_size=10, time_windo
         bid_segments = {}
         ask_segments = {}
         
+        # Process bid segments
         for seg in range(num_segments):
             start_idx = seg * segment_size
             end_idx = min((seg + 1) * segment_size, len(bids))
@@ -392,35 +452,31 @@ def process_orderbook_segmented(df, num_levels=1000, segment_size=10, time_windo
             segment_bids = bids[start_idx:end_idx]
             if not segment_bids:
                 continue
-                
-            seg_volume = 0
-            seg_price_weighted = 0
-            seg_prices = []
             
-            for bid in segment_bids:
-                price = bid['price']
-                volume = bid['volume']
-                
-                seg_volume += volume
-                seg_price_weighted += price * volume
-                seg_prices.append(price)
+            # Use numpy for faster calculations
+            seg_prices = np.array([bid['price'] for bid in segment_bids])
+            seg_volumes = np.array([bid['volume'] for bid in segment_bids])
+            
+            seg_volume = np.sum(seg_volumes)
+            seg_price_weighted = np.sum(seg_prices * seg_volumes)
             
             total_bid_volume += seg_volume
             bid_notional += seg_price_weighted
             
             if seg_volume > 0:
                 bid_segments[seg] = {
-                    'avg_price': sum(seg_prices) / len(seg_prices),
+                    'avg_price': np.mean(seg_prices),
                     'vwap': seg_price_weighted / seg_volume,
                     'volume': seg_volume,
-                    'min_price': min(seg_prices),
-                    'max_price': max(seg_prices)
+                    'min_price': np.min(seg_prices),
+                    'max_price': np.max(seg_prices)
                 }
                 
                 new_row[f'bid_price_segment_{seg+1}'] = bid_segments[seg]['avg_price']
                 new_row[f'bid_vwap_segment_{seg+1}'] = bid_segments[seg]['vwap']
                 new_row[f'bid_volume_segment_{seg+1}'] = seg_volume
         
+        # Process ask segments - similar to bid segments
         for seg in range(num_segments):
             start_idx = seg * segment_size
             end_idx = min((seg + 1) * segment_size, len(asks))
@@ -431,29 +487,24 @@ def process_orderbook_segmented(df, num_levels=1000, segment_size=10, time_windo
             segment_asks = asks[start_idx:end_idx]
             if not segment_asks:
                 continue
-                
-            seg_volume = 0
-            seg_price_weighted = 0
-            seg_prices = []
             
-            for ask in segment_asks:
-                price = ask['price']
-                volume = ask['volume']
-                
-                seg_volume += volume
-                seg_price_weighted += price * volume
-                seg_prices.append(price)
+            # Use numpy for faster calculations
+            seg_prices = np.array([ask['price'] for ask in segment_asks])
+            seg_volumes = np.array([ask['volume'] for ask in segment_asks])
+            
+            seg_volume = np.sum(seg_volumes)
+            seg_price_weighted = np.sum(seg_prices * seg_volumes)
             
             total_ask_volume += seg_volume
             ask_notional += seg_price_weighted
             
             if seg_volume > 0:
                 ask_segments[seg] = {
-                    'avg_price': sum(seg_prices) / len(seg_prices),
+                    'avg_price': np.mean(seg_prices),
                     'vwap': seg_price_weighted / seg_volume,
                     'volume': seg_volume,
-                    'min_price': min(seg_prices),
-                    'max_price': max(seg_prices)
+                    'min_price': np.min(seg_prices),
+                    'max_price': np.max(seg_prices)
                 }
                 
                 new_row[f'ask_price_segment_{seg+1}'] = ask_segments[seg]['avg_price']
@@ -488,44 +539,23 @@ def process_orderbook_segmented(df, num_levels=1000, segment_size=10, time_windo
         if total_ask_volume > 0:
             new_row['ask_vwap'] = ask_notional / total_ask_volume
         
-        # Microstructure features
-        
-        # Order book slope (linear regression)
+        # Microstructure features - calculate only if enough segments exist
         if len(bid_segments) >= 3:
-            x_bid = []
-            y_bid = []
-            for seg_idx, seg_data in bid_segments.items():
-                x_bid.append(seg_data['avg_price'])
-                y_bid.append(seg_data['volume'])
+            # Use numpy for linear regression calculation
+            x_bid = np.array([seg_data['avg_price'] for seg_data in bid_segments.values()])
+            y_bid = np.array([seg_data['volume'] for seg_data in bid_segments.values()])
             
-            if x_bid and y_bid:
-                x_bid_mean = sum(x_bid) / len(x_bid)
-                y_bid_mean = sum(y_bid) / len(y_bid)
-                
-                numerator = sum((x - x_bid_mean) * (y - y_bid_mean) for x, y in zip(x_bid, y_bid))
-                denominator = sum((x - x_bid_mean) ** 2 for x in x_bid)
-                
-                if denominator != 0:
-                    bid_slope = numerator / denominator
-                    new_row['bid_slope'] = bid_slope
+            if len(x_bid) > 1:  # Need at least 2 points for regression
+                bid_slope = np.polyfit(x_bid, y_bid, 1)[0]
+                new_row['bid_slope'] = bid_slope
         
         if len(ask_segments) >= 3:
-            x_ask = []
-            y_ask = []
-            for seg_idx, seg_data in ask_segments.items():
-                x_ask.append(seg_data['avg_price'])
-                y_ask.append(seg_data['volume'])
+            x_ask = np.array([seg_data['avg_price'] for seg_data in ask_segments.values()])
+            y_ask = np.array([seg_data['volume'] for seg_data in ask_segments.values()])
             
-            if x_ask and y_ask:
-                x_ask_mean = sum(x_ask) / len(x_ask)
-                y_ask_mean = sum(y_ask) / len(y_ask)
-                
-                numerator = sum((x - x_ask_mean) * (y - y_ask_mean) for x, y in zip(x_ask, y_ask))
-                denominator = sum((x - x_ask_mean) ** 2 for x in x_ask)
-                
-                if denominator != 0:
-                    ask_slope = numerator / denominator
-                    new_row['ask_slope'] = ask_slope
+            if len(x_ask) > 1:  # Need at least 2 points for regression
+                ask_slope = np.polyfit(x_ask, y_ask, 1)[0]
+                new_row['ask_slope'] = ask_slope
         
         # Book pressure ratio (top 3 segments)
         top_bid_volume = sum(bid_segments[seg]['volume'] for seg in range(min(3, len(bid_segments))) if seg in bid_segments)
@@ -533,15 +563,6 @@ def process_orderbook_segmented(df, num_levels=1000, segment_size=10, time_windo
         
         if top_ask_volume > 0:
             new_row['book_pressure_ratio'] = top_bid_volume / top_ask_volume
-        
-        # Distance to large orders
-        large_bid_distance = find_large_order_distance(bids, best_bid, 'bid')
-        large_ask_distance = find_large_order_distance(asks, best_ask, 'ask')
-        
-        if large_bid_distance:
-            new_row['large_bid_distance_bps'] = abs(large_bid_distance / mid_price * 10000)
-        if large_ask_distance:
-            new_row['large_ask_distance_bps'] = abs(large_ask_distance / mid_price * 10000)
         
         # Liquidity concentration
         if total_bid_volume > 0:
@@ -552,29 +573,6 @@ def process_orderbook_segmented(df, num_levels=1000, segment_size=10, time_windo
         processed_data.append(new_row)
     
     result_df = pd.DataFrame(processed_data)
-
-    return result_df
-
-def Technical_indicator(result_df,time_window):
-    
-    # Add time-series features
-    if len(result_df) > 1:
-        # Returns
-        if 'mid_price' in result_df.columns:
-            result_df['return'] = result_df['mid_price'].pct_change()
-        
-        # Volatility (rolling standard deviation of returns)
-        if 'return' in result_df.columns and len(result_df) > time_window:
-            result_df['volatility'] = result_df['return'].rolling(time_window).std()
-        
-        # Momentum (cumulative return over window)
-        if 'return' in result_df.columns and len(result_df) > time_window:
-            result_df['momentum'] = result_df['return'].rolling(time_window).sum()
-        
-        # Imbalance trend
-        if 'volume_imbalance' in result_df.columns and len(result_df) > time_window:
-            result_df['imbalance_trend'] = result_df['volume_imbalance'].diff()
-
     return result_df
 
 
